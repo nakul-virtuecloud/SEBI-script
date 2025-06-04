@@ -1,0 +1,264 @@
+import os
+import time
+import requests
+import json
+import logging
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("sid_downloader.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Progress tracker functions
+def save_progress(category_index, fund_index):
+    """Save current progress to a file."""
+    progress = {
+        "category_index": category_index,
+        "fund_index": fund_index
+    }
+    with open("sid_progress.json", "w") as f:
+        json.dump(progress, f)
+    logger.info(f"Progress saved: category {category_index}, fund {fund_index}")
+
+def load_progress():
+    """Load progress from file."""
+    try:
+        with open("sid_progress.json", "r") as f:
+            progress = json.load(f)
+        logger.info(f"Resuming from: category {progress['category_index']}, fund {progress['fund_index']}")
+        return progress["category_index"], progress["fund_index"]
+    except (FileNotFoundError, json.JSONDecodeError):
+        logger.info("No progress file found or invalid format. Starting from beginning.")
+        return 0, 0
+
+def download_sid_documents(download_dir="downloads/sid"):
+    """Download SID PDFs from SEBI website."""
+    # Create download directory
+    if not os.path.exists(download_dir):
+        os.makedirs(download_dir)
+        logger.info(f"Created download directory: {download_dir}")
+    
+    # Load progress if available
+    last_category_index, last_fund_index = load_progress()
+    
+    # Configure Chrome options
+    chrome_options = webdriver.ChromeOptions()
+    prefs = {
+        'download.default_directory': os.path.abspath(download_dir),
+        'download.prompt_for_download': False,
+        'download.directory_upgrade': True,
+        'plugins.always_open_pdf_externally': True
+    }
+    chrome_options.add_experimental_option('prefs', prefs)
+    
+    # Initialize driver
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.maximize_window()
+    
+    try:
+        # Process SID documents
+        sid_url = "https://www.sebi.gov.in/sebiweb/other/OtherAction.do?doMutualFund=yes&mftype=2"
+        logger.info(f"\n--- Processing SID documents ---")
+        logger.info(f"Navigating to SID page: {sid_url}")
+        driver.get(sid_url)
+        
+        # Wait for page to load
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "table")))
+        logger.info("SID page loaded successfully.")
+        
+        # Find all links in the table (including JavaScript links)
+        js_links = driver.find_elements(By.XPATH, "//table//a[contains(@onclick, 'getmutuakFund') or contains(@href, 'javascript:getmutuakFund')]")
+        if not js_links:
+            js_links = driver.find_elements(By.XPATH, "//table//a")
+            logger.info(f"Found {len(js_links)} links on SID page, checking for JavaScript links...")
+            
+            # Filter for JavaScript links
+            js_links = [link for link in js_links if 'javascript:' in link.get_attribute('href') or 'javascript:' in link.get_attribute('onclick') or 'getmutuakFund' in link.get_attribute('onclick')]
+        
+        logger.info(f"Found {len(js_links)} mutual fund category links")
+        
+        # Process each category link
+        for i, js_link in enumerate(js_links):
+            # Skip categories we've already processed
+            if i < last_category_index:
+                logger.info(f"Skipping already processed category {i+1}")
+                continue
+            
+            try:
+                category_name = js_link.text.strip()
+                logger.info(f"Processing category {i+1}: {category_name}")
+                
+                # Click on the JavaScript link
+                js_link.click()
+                time.sleep(3)
+                
+                # Switch to the new tab if opened
+                if len(driver.window_handles) > 1:
+                    driver.switch_to.window(driver.window_handles[-1])
+                
+                # Wait for fund list page to load
+                WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "table")))
+                logger.info("Fund list page loaded.")
+                
+                # Find all fund detail JavaScript links
+                fund_links = driver.find_elements(By.XPATH, "//table//a[contains(@onclick, 'getfundDetails') or contains(@href, 'javascript:getfundDetails')]")
+                if not fund_links:
+                    fund_links = driver.find_elements(By.XPATH, "//table//a")
+                    logger.info(f"Found {len(fund_links)} links on fund list page, checking for JavaScript links...")
+                    
+                    # Filter for JavaScript links
+                    fund_links = [link for link in fund_links if 'javascript:' in link.get_attribute('href') or 'javascript:' in link.get_attribute('onclick') or 'getfundDetails' in link.get_attribute('onclick')]
+                
+                logger.info(f"Found {len(fund_links)} fund links")
+                
+                # Process each fund link
+                for j, fund_link in enumerate(fund_links):
+                    # Skip funds we've already processed
+                    if i == last_category_index and j < last_fund_index:
+                        logger.info(f"Skipping already processed fund {j+1}")
+                        continue
+                    
+                    try:
+                        fund_name = fund_link.text.strip()
+                        logger.info(f"Processing fund {j+1}: {fund_name}")
+                        
+                        # Save current progress
+                        save_progress(i, j)
+                        
+                        # Click on the fund link
+                        fund_link.click()
+                        time.sleep(3)
+                        
+                        # Switch to the new tab if opened
+                        if len(driver.window_handles) > 2:
+                            driver.switch_to.window(driver.window_handles[-1])
+                        
+                        # Wait for fund details page to load
+                        time.sleep(3)
+                        
+                        # Look for the download button
+                        try:
+                            download_button = driver.find_element(By.CSS_SELECTOR, "#secondaryDownload")
+                            logger.info(f"Found download button for {fund_name}")
+                            
+                            # Create filename for checking if already downloaded
+                            safe_name = fund_name.replace(" ", "_").replace("/", "_")
+                            if not safe_name:
+                                safe_name = f"fund_{j+1}"
+                            filename = f"{safe_name}_SID.pdf"
+                            filepath = os.path.join(download_dir, filename)
+                            
+                            # Check if file already exists
+                            if os.path.exists(filepath):
+                                logger.info(f"File already exists: {filename} - skipping download")
+                            else:
+                                # Click the download button
+                                download_button.click()
+                                logger.info(f"Clicked download button for {fund_name}")
+                                time.sleep(3)
+                        except NoSuchElementException:
+                            logger.info(f"No download button found for {fund_name}")
+                            
+                            # Try alternative methods - look for iframe
+                            try:
+                                iframe = driver.find_element(By.XPATH, "//iframe[contains(@src, '.pdf')]")
+                                src = iframe.get_attribute("src")
+                                if "file=" in src:
+                                    pdf_url = src.split("file=")[1]
+                                    if "&" in pdf_url:
+                                        pdf_url = pdf_url.split("&")[0]
+                                    
+                                    # Create filename
+                                    safe_name = fund_name.replace(" ", "_").replace("/", "_")
+                                    if not safe_name:
+                                        safe_name = f"fund_{j+1}"
+                                    filename = f"{safe_name}_SID.pdf"
+                                    
+                                    # Download PDF directly
+                                    logger.info(f"Downloading PDF from iframe: {pdf_url}")
+                                    download_pdf(pdf_url, filename, download_dir)
+                            except NoSuchElementException:
+                                logger.warning(f"No iframe found for {fund_name}")
+                        
+                        # Close fund details tab and switch back to fund list tab
+                        if len(driver.window_handles) > 2:
+                            driver.close()
+                            driver.switch_to.window(driver.window_handles[-1])
+                    except Exception as e:
+                        logger.error(f"Error processing fund {fund_name}: {str(e)}")
+                        # Make sure we're back on the fund list tab
+                        if len(driver.window_handles) > 2:
+                            driver.close()
+                            driver.switch_to.window(driver.window_handles[-1])
+                
+                # Close fund list tab and switch back to main tab
+                if len(driver.window_handles) > 1:
+                    driver.close()
+                    driver.switch_to.window(driver.window_handles[0])
+            except Exception as e:
+                logger.error(f"Error processing category {category_name}: {str(e)}")
+                # Make sure we're back on the main tab
+                while len(driver.window_handles) > 1:
+                    driver.close()
+                    driver.switch_to.window(driver.window_handles[0])
+        
+        logger.info("\nAll SID documents processed successfully.")
+        # Clear progress file when done
+        if os.path.exists("sid_progress.json"):
+            os.remove("sid_progress.json")
+            logger.info("Progress file cleared.")
+    
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+    finally:
+        driver.quit()
+        logger.info("Browser closed.")
+
+def download_pdf(url, filename, download_dir, max_retries=3):
+    """Download PDF directly using requests with retry mechanism."""
+    filepath = os.path.join(download_dir, filename)
+    
+    # Check if file already exists
+    if os.path.exists(filepath):
+        logger.info(f"File already exists: {filename} - skipping download")
+        return True
+    
+    for attempt in range(max_retries):
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            logger.info(f"Download attempt {attempt+1}/{max_retries} for {filename}")
+            response = requests.get(url, headers=headers, stream=True, timeout=30)
+            response.raise_for_status()
+            
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            logger.info(f"Downloaded: {filename}")
+            return True
+        except Exception as e:
+            logger.warning(f"Attempt {attempt+1} failed to download {url}: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = 2 * (attempt + 1)  # Exponential backoff
+                logger.info(f"Waiting {wait_time} seconds before retrying...")
+                time.sleep(wait_time)
+    
+    logger.error(f"Failed to download {url} after {max_retries} attempts")
+    return False
+
+if __name__ == "__main__":
+    download_sid_documents()
